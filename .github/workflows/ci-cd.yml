@@ -1,0 +1,95 @@
+name: CI/CD - Build & Push Docker Image
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  IMAGE_NAME: devops-intern-project
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: git
+        run: echo "GIT_SHORT=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: buildx-${{ env.IMAGE_NAME }}-${{ github.sha }}
+          restore-keys: |
+            buildx-${{ env.IMAGE_NAME }}-
+
+      - name: Determine registry target
+        id: registry-check
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ] && [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "REGISTRY_TYPE=dockerhub" >> $GITHUB_ENV
+          elif [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] && [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] && [ -n "${{ secrets.AWS_ACCOUNT_ID }}" ] && [ -n "${{ secrets.AWS_REGION }}" ]; then
+            echo "REGISTRY_TYPE=ecr" >> $GITHUB_ENV
+          else
+            echo "REGISTRY_TYPE=none" >> $GITHUB_ENV
+          fi
+          echo "Using registry: $REGISTRY_TYPE"
+
+      - name: Docker Hub - Login
+        if: env.REGISTRY_TYPE == 'dockerhub'
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login --username "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: AWS ECR - Configure & Login
+        if: env.REGISTRY_TYPE == 'ecr'
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to ECR (get auth)
+        if: env.REGISTRY_TYPE == 'ecr'
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+        env:
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY_TYPE == 'dockerhub' && format('{0}/{1}:{2}', secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME, env.GIT_SHORT) || '' }}
+            ${{ env.REGISTRY_TYPE == 'dockerhub' && format('{0}/{1}:latest', secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
+            ${{ env.REGISTRY_TYPE == 'ecr' && format('{0}.dkr.ecr.{1}.amazonaws.com/{2}:{3}', secrets.AWS_ACCOUNT_ID, secrets.AWS_REGION, env.IMAGE_NAME, env.GIT_SHORT) || '' }}
+            ${{ env.REGISTRY_TYPE == 'ecr' && format('{0}.dkr.ecr.{1}.amazonaws.com/{2}:latest', secrets.AWS_ACCOUNT_ID, secrets.AWS_REGION, env.IMAGE_NAME) || '' }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+
+      - name: Output image info
+        run: |
+          if [ "$REGISTRY_TYPE" = "dockerhub" ]; then
+            echo "IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${GIT_SHORT}" >> $GITHUB_ENV
+          elif [ "$REGISTRY_TYPE" = "ecr" ]; then
+            echo "IMAGE=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.IMAGE_NAME }}:${GIT_SHORT}" >> $GITHUB_ENV
+          else
+            echo "No registry configured. Set Docker Hub or AWS ECR secrets." >&2
+            exit 1
+          fi
+          echo "Built and pushed $IMAGE"
